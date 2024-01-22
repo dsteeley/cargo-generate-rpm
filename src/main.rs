@@ -53,6 +53,19 @@ fn determine_output_dir(
     }
 }
 
+fn determine_cache_file(output: Option<&PathBuf>, build_target: &BuildTarget) -> PathBuf {
+    let dir = match output.as_ref().map(PathBuf::from) {
+        Some(path) => path,
+        None => build_target.target_path("generate-rpm"),
+    };
+    use glob::glob;
+    glob(&format!("{}/*.rpm", dir.as_os_str().to_str().unwrap()))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+}
+
 fn run() -> Result<(), Error> {
     let mut args = std::env::args();
     let args = if let Some("generate-rpm") = args.nth(1).as_deref() {
@@ -70,10 +83,21 @@ fn run() -> Result<(), Error> {
     } else {
         Config::new(Path::new(""), None, &extra_metadata)?
     };
+
+    // Cached rpm support.
+    if args.enable_build_caching {
+        let cache_rpm_file_name = determine_cache_file(args.output.as_ref(), &build_target);
+        let cached_gitbom = config::read_cached_gitbom(cache_rpm_file_name);
+        if let Ok(gitbom) = cached_gitbom {
+            if gitbom == config.generate_gitbom()? {
+                return Ok(());
+            }
+        };
+    }
+
     let rpm_pkg = config
         .create_rpm_builder(BuilderConfig::new(&build_target, &args))?
         .build()?;
-
     let pkg_name = rpm_pkg.metadata.get_name()?;
     let pkg_version = rpm_pkg.metadata.get_version()?;
     let pkg_release = rpm_pkg

@@ -73,6 +73,10 @@ pub struct Cli {
     /// Shortcut to --metadata-overwrite=path/to/Cargo.toml#package.metadata.generate-rpm.variants.VARIANT
     #[arg(long, value_delimiter = ',')]
     pub variant: Vec<String>,
+
+    /// Optionally turn on caching support
+    #[arg(long)]
+    pub enable_build_caching: bool,
 }
 
 impl Default for Cli {

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use cargo_toml::Error as CargoTomlError;
 use cargo_toml::Manifest;
 use rpm::Dependency;
+use sha2::{Digest, Sha256};
 use toml::value::Table;
 
 use crate::auto_req::{find_requires, AutoReqMode};
@@ -325,8 +326,118 @@ impl Config {
             }
         }
 
+        builder = builder.cookie(self.generate_gitbom()?);
+
         Ok(builder)
     }
+
+    pub(crate) fn generate_gitbom(&self) -> Result<String, Error> {
+        // Gather up the information that informs us of a cache hit
+        // 1. Assets
+        // 2. package.generate-rpm metadata
+        // 3. cargo generate-rpm version
+
+        // Use the following two crates for GitOid and Omnibom
+        // https://docs.rs/gitoid/0.1.5/gitoid/struct.GitOid.html
+        // https://docs.rs/gitbom/latest/gitbom/struct.GitBom.html#
+
+        let gen_rpm_metadata = self
+            .manifest
+            .package
+            .as_ref()
+            .ok_or_else(|| Error::Config(ConfigError::Missing("package".to_string())))?
+            .metadata
+            .as_ref()
+            .ok_or_else(|| Error::Config(ConfigError::Missing("package.metadata".to_string())))?
+            .get("generate-rpm")
+            .ok_or_else(|| {
+                Error::Config(ConfigError::Missing(
+                    "package.metadata.generate-rpm".to_string(),
+                ))
+            })?;
+        // hash the metadata string
+        let rpm_meta_gitoid = gitoid::GitOid::new_from_str(
+            gitoid::HashAlgorithm::Sha256,
+            gitoid::ObjectType::Blob,
+            gen_rpm_metadata.to_string().as_str(),
+        );
+        let gitbom = gitbom::GitBom::new();
+
+        let assets = gen_rpm_metadata
+            .get("assets")
+            .ok_or_else(|| {
+                Error::Config(ConfigError::Missing(
+                    "package.metadata.generate-rpm.assets".to_string(),
+                ))
+            })?
+            .as_array()
+            .ok_or_else(|| {
+                Error::Config(ConfigError::WrongType(
+                    "package.metadata.generate-rpm.assets".to_string(),
+                    "array",
+                ))
+            })?
+            .iter()
+            .map(|v| {
+                let asset_path: PathBuf = v
+                    .get("source")
+                    .ok_or_else(|| {
+                        Error::Config(ConfigError::WrongType(
+                            "package.metadata.generate-rpm.assets".to_string(),
+                            "string",
+                        ))
+                    })?
+                    .to_string()
+                    .replace('\"', "")
+                    .into();
+                std::fs::read(&asset_path).map_err(|e| Error::FileIo(asset_path.clone(), e))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+
+        let tool_version_gitoid = gitoid::GitOid::new_from_str(
+            gitoid::HashAlgorithm::Sha256,
+            gitoid::ObjectType::Blob,
+            clap::crate_version!(),
+        );
+
+        let gitbom = gitbom.add_many(
+            assets
+                .iter()
+                .map(|v| {
+                    gitoid::GitOid::new_from_bytes(
+                        gitoid::HashAlgorithm::Sha256,
+                        gitoid::ObjectType::Blob,
+                        v,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let gitbom = gitbom.add_many(vec![rpm_meta_gitoid, tool_version_gitoid]);
+
+        // Write the gitbom to file and determine the digest.
+        let binding = gitbom
+            .get_sorted_oids()
+            .iter()
+            .map(|o| format!("{}", o.hash()))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let gitbom_digest = binding.as_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(gitbom_digest);
+        let result: String = hex::encode(hasher.finalize());
+        Ok(result)
+    }
+}
+
+pub(crate) fn read_cached_gitbom(rpm: PathBuf) -> Result<String, Error> {
+    // Read the cached rpm
+    // Read the cookie header from the rpm
+    let rpm_file = std::fs::File::open(rpm)?;
+    let mut buf_reader = std::io::BufReader::new(rpm_file);
+    let pkg = rpm::Package::parse(&mut buf_reader)?;
+    let cookie = pkg.metadata.get_cookie()?;
+    Ok(cookie.to_string())
 }
 
 pub(crate) fn load_script_if_path<P: AsRef<Path>>(
